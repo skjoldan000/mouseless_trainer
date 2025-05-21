@@ -1,6 +1,6 @@
 # Mouse Clicker Trainer
 
-A Python-based mouse clicker trainer application designed to help users improve their mouse accuracy and reaction speed.
+A Python-based mouse clicker trainer application designed to help users improve their mouse accuracy and reaction speed, particularly designed for training of Mouseless and similar keyboard-mouse implementations.
 
 ## Features
 

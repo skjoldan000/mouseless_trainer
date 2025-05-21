@@ -25,15 +25,15 @@ RESULTS_DIR = "results"
 DATAFRAME_COLUMNS = [
     "click_datetime", "reaction_time", "precision_factor", "round_start_time_iso",
     "game_version", "target_radius", "misses_since_last_hit",
-    "round_number", "click_in_round_number"
+    "round_number", "click_in_round_number", "clicked_quadrant"
 ]
 
 WINDOW_WIDTH = 800 # Will be updated to screen width
 WINDOW_HEIGHT = 600 # Will be updated to screen height
 CIRCLE_RADIUS = 30
 MAX_CIRCLES = 1 
-TARGET_COLOR = "darkyellow" 
-BACKGROUND_COLOR = "grey" 
+TARGET_COLOR = "orange" 
+BACKGROUND_COLOR = "lightgrey" 
 SCORE_FONT = ("Arial", 14)
 MAX_HISTORY_LENGTH = 10
 CIRCLES_PER_ROUND = 10 
@@ -41,6 +41,13 @@ CIRCLES_PER_ROUND = 10
 START_NEXT_ROUND_CIRCLE_COLOR = "orange"
 START_NEXT_ROUND_CIRCLE_RADIUS = 50
 SUMMARY_FONT = ("Arial", 20, "bold")
+
+# Quadrant UI
+QUAD_INDICATOR_ENABLED_COLOR = "orange"
+QUAD_INDICATOR_DISABLED_COLOR = "darkkhaki" 
+QUAD_INDICATOR_WIDTH = 16 * 5
+QUAD_INDICATOR_HEIGHT = 10 * 5
+QUAD_INDICATOR_KEY_FONT = ("Arial", 7) 
 
 # Quadrant spawning flags
 spawn_q1_top_right = True
@@ -71,6 +78,19 @@ current_round_start_time = None # Stores datetime object for the start of the ro
 miss_counter_since_last_hit = 0
 current_round_data_rows = [] # List of dicts for current round's data
 all_time_results_df = pd.DataFrame(columns=DATAFRAME_COLUMNS) # Holds all loaded CSV data
+
+# New UI state for quadrant indicators
+quad_indicator_canvas_ids = {"q2_tl": None, "q1_tr": None, "q3_bl": None, "q4_br": None} # For the rectangle shapes
+quad_indicator_text_ids = {"q2_tl": None, "q1_tr": None, "q3_bl": None, "q4_br": None}   # For the text (U, I, J, K) on the shapes
+quad_error_message_id = None # To store the canvas ID of the "Please enable a quadrant" message
+
+# Mapping for easy access to keys, flags, and display text for indicators
+QUAD_CONFIG_MAP = {
+    "q2_tl": {"key_char": "U", "spawn_flag_name": "spawn_q2_top_left", "x_mult": 0, "y_mult": 0},
+    "q1_tr": {"key_char": "I", "spawn_flag_name": "spawn_q1_top_right", "x_mult": 1, "y_mult": 0},
+    "q3_bl": {"key_char": "J", "spawn_flag_name": "spawn_q3_bottom_left", "x_mult": 0, "y_mult": 1},
+    "q4_br": {"key_char": "K", "spawn_flag_name": "spawn_q4_bottom_right", "x_mult": 1, "y_mult": 1}
+}
 
 # --- Main Application Class ---
 class ClickTrainerApp:
@@ -116,11 +136,17 @@ class ClickTrainerApp:
 
         # Round progress label (top center)
         self.round_progress_label = tk.Label(master, text="", font=SCORE_FONT, fg="black", bg=BACKGROUND_COLOR)
-        self.round_progress_label.place(relx=0.5, y=10, anchor=tk.N) # anchor=tk.N centers it based on top edge
+        self.round_progress_label.place(relx=0.5, y=10, anchor=tk.N)
 
         # Key bindings
         master.bind('<q>', self.quit_game)
-        master.bind('<r>', self.reset_game_event) # Changed back to reset_game_event
+        master.bind('<r>', self.reset_game_event)
+
+        # Quadrant toggle key bindings
+        master.bind('<u>', self.toggle_q2_tl_event) # Top-Left
+        master.bind('<i>', self.toggle_q1_tr_event) # Top-Right
+        master.bind('<j>', self.toggle_q3_bl_event) # Bottom-Left
+        master.bind('<k>', self.toggle_q4_br_event) # Bottom-Right
 
         # Ensure results directory exists
         os.makedirs(RESULTS_DIR, exist_ok=True)
@@ -135,10 +161,20 @@ class ClickTrainerApp:
         self.reset_game()
 
     def clear_summary_elements(self):
-        global summary_elements_ids
+        global summary_elements_ids, quad_indicator_canvas_ids, quad_indicator_text_ids, quad_error_message_id
         for element_id in summary_elements_ids:
             self.canvas.delete(element_id)
         summary_elements_ids.clear()
+
+        for key_map in [quad_indicator_canvas_ids, quad_indicator_text_ids]:
+            for key in key_map:
+                if key_map[key]:
+                    self.canvas.delete(key_map[key])
+                key_map[key] = None
+        
+        if quad_error_message_id:
+            self.canvas.delete(quad_error_message_id)
+            quad_error_message_id = None
 
     def reset_game(self):
         global circles, score_history, last_click_points, avg_points, last_reaction_time, avg_reaction_time, start_time
@@ -244,11 +280,7 @@ class ClickTrainerApp:
         # For now, we just print. Example: print(all_time_results_df.head())
 
         game_paused_for_summary = True
-
-        # Clear existing game circles (as MAX_CIRCLES is 1, this will be one circle)
-        for circle_data in circles[:]:
-            self.canvas.delete(circle_data["id"])
-        circles.clear()
+        self.draw_or_update_quad_indicators() # Draw/update indicators when summary is shown
 
         # Calculate round summary
         round_avg_score = 0
@@ -259,7 +291,7 @@ class ClickTrainerApp:
             round_avg_score = total_round_points // len(current_round_score_history)
             round_avg_time = total_round_time / len(current_round_score_history)
 
-        # Display summary text
+        # Display summary text (ensure this happens after indicators so text isn't covered if overlap)
         summary_y_start = WINDOW_HEIGHT // 2 - 100
         if current_round_number == 0:
             text_id1 = self.canvas.create_text(WINDOW_WIDTH // 2, summary_y_start,
@@ -333,22 +365,27 @@ class ClickTrainerApp:
             # Min/max for x and y within the quadrant
             x_min, x_max, y_min, y_max = 0, 0, 0, 0
 
+            quad_name = "unknown" # For logging
             if chosen_quadrant == 1: # Top-Right
+                quad_name = "tr"
                 x_min = mid_x + CIRCLE_RADIUS
                 x_max = WINDOW_WIDTH - CIRCLE_RADIUS
                 y_min = CIRCLE_RADIUS
                 y_max = mid_y - CIRCLE_RADIUS
             elif chosen_quadrant == 2: # Top-Left
+                quad_name = "tl"
                 x_min = CIRCLE_RADIUS
                 x_max = mid_x - CIRCLE_RADIUS
                 y_min = CIRCLE_RADIUS
                 y_max = mid_y - CIRCLE_RADIUS
             elif chosen_quadrant == 3: # Bottom-Left
+                quad_name = "bl"
                 x_min = CIRCLE_RADIUS
                 x_max = mid_x - CIRCLE_RADIUS
                 y_min = mid_y + CIRCLE_RADIUS
                 y_max = WINDOW_HEIGHT - CIRCLE_RADIUS
             elif chosen_quadrant == 4: # Bottom-Right
+                quad_name = "br"
                 x_min = mid_x + CIRCLE_RADIUS
                 x_max = WINDOW_WIDTH - CIRCLE_RADIUS
                 y_min = mid_y + CIRCLE_RADIUS
@@ -367,7 +404,7 @@ class ClickTrainerApp:
             circle_id = self.canvas.create_oval(x - CIRCLE_RADIUS, y - CIRCLE_RADIUS,
                                                 x + CIRCLE_RADIUS, y + CIRCLE_RADIUS,
                                                 fill=TARGET_COLOR, outline=TARGET_COLOR)
-            circles.append({"id": circle_id, "x": x, "y": y, "radius": CIRCLE_RADIUS, "spawn_time": time.time()})
+            circles.append({"id": circle_id, "x": x, "y": y, "radius": CIRCLE_RADIUS, "spawn_time": time.time(), "quadrant_name": quad_name})
             # The original start_time logic for a single global timer seems less relevant now 
             # as each circle has its own spawn_time. If MAX_CIRCLES=1, it's equivalent.
             # if len(circles) == 1:
@@ -395,6 +432,11 @@ class ClickTrainerApp:
             if summary_circle_data:
                 dist_sq_summary = (event.x - summary_circle_data["x"])**2 + (event.y - summary_circle_data["y"])**2
                 if dist_sq_summary <= summary_circle_data["radius"]**2:
+                    # Check if at least one quadrant is enabled before starting
+                    if not self.check_and_display_quad_error():
+                        print("Attempted to start round with no quadrants enabled.")
+                        return # Don't start the round
+
                     print("Starting next round...")
                     if current_round_number == 0: # If it was the welcome screen
                         current_round_number = 1 # Start with Round 1
@@ -440,7 +482,8 @@ class ClickTrainerApp:
                     "target_radius": CIRCLE_RADIUS,
                     "misses_since_last_hit": miss_counter_since_last_hit,
                     "round_number": current_round_number,
-                    "click_in_round_number": current_round_clicks + 1 # current_round_clicks not yet incremented
+                    "click_in_round_number": current_round_clicks + 1, # current_round_clicks not yet incremented
+                    "clicked_quadrant": circle_data.get("quadrant_name", "unknown") # Log the quadrant
                 }
                 current_round_data_rows.append(click_data_row)
                 miss_counter_since_last_hit = 0
@@ -511,6 +554,103 @@ class ClickTrainerApp:
         else:
             print("No previous results found to load.")
             all_time_results_df = pd.DataFrame(columns=DATAFRAME_COLUMNS)
+
+    def draw_or_update_quad_indicators(self):
+        global quad_indicator_canvas_ids, quad_indicator_text_ids, QUAD_CONFIG_MAP
+        global QUAD_INDICATOR_WIDTH, QUAD_INDICATOR_HEIGHT, QUAD_INDICATOR_ENABLED_COLOR, QUAD_INDICATOR_DISABLED_COLOR, QUAD_INDICATOR_KEY_FONT
+        global summary_elements_ids, spawn_q1_top_right, spawn_q2_top_left, spawn_q3_bottom_left, spawn_q4_bottom_right # Direct flag access
+
+        start_button_y_center = WINDOW_HEIGHT // 2 - 100 + 150
+        grid_base_y = start_button_y_center + START_NEXT_ROUND_CIRCLE_RADIUS + 30 # Increased padding a bit
+
+        grid_total_width = (QUAD_INDICATOR_WIDTH * 2) # No padding between indicators
+        grid_start_x = (WINDOW_WIDTH - grid_total_width) // 2
+
+        # Clear previous error message if any (it will be redrawn if still needed by handle_click)
+        global quad_error_message_id
+        if quad_error_message_id:
+            self.canvas.delete(quad_error_message_id)
+            quad_error_message_id = None
+
+        for q_map_key, config in QUAD_CONFIG_MAP.items():
+            q_flag = globals()[config["spawn_flag_name"]] # Get current state of the spawn flag
+            x_offset_mult = config["x_mult"]
+            y_offset_mult = config["y_mult"]
+            key_char = config["key_char"]
+
+            x0 = grid_start_x + (x_offset_mult * QUAD_INDICATOR_WIDTH)
+            y0 = grid_base_y + (y_offset_mult * QUAD_INDICATOR_HEIGHT)
+            x1 = x0 + QUAD_INDICATOR_WIDTH
+            y1 = y0 + QUAD_INDICATOR_HEIGHT
+
+            color = QUAD_INDICATOR_ENABLED_COLOR if q_flag else QUAD_INDICATOR_DISABLED_COLOR
+
+            if quad_indicator_canvas_ids[q_map_key]:
+                self.canvas.delete(quad_indicator_canvas_ids[q_map_key])
+            rect_id = self.canvas.create_rectangle(x0, y0, x1, y1, fill=color, outline="black")
+            quad_indicator_canvas_ids[q_map_key] = rect_id
+            if rect_id not in summary_elements_ids: summary_elements_ids.append(rect_id)
+
+            # Add key text
+            if quad_indicator_text_ids[q_map_key]:
+                self.canvas.delete(quad_indicator_text_ids[q_map_key])
+            text_color = "black" if q_flag else "gray40" # Dim text if disabled
+            text_id = self.canvas.create_text(x0 + QUAD_INDICATOR_WIDTH / 2, 
+                                               y0 + QUAD_INDICATOR_HEIGHT / 2, 
+                                               text=key_char, 
+                                               font=QUAD_INDICATOR_KEY_FONT, 
+                                               fill=text_color)
+            quad_indicator_text_ids[q_map_key] = text_id
+            if text_id not in summary_elements_ids: summary_elements_ids.append(text_id)
+
+    def toggle_quadrant_flag(self, flag_name_key_in_map):
+        """Toggles a quadrant flag using QUAD_CONFIG_MAP and redraws UI if summary is active."""
+        global game_paused_for_summary, QUAD_CONFIG_MAP
+        spawn_flag_to_toggle = QUAD_CONFIG_MAP[flag_name_key_in_map]["spawn_flag_name"]
+
+        current_value = globals()[spawn_flag_to_toggle]
+        globals()[spawn_flag_to_toggle] = not current_value
+        print(f"Toggled {spawn_flag_to_toggle} to {globals()[spawn_flag_to_toggle]}")
+        
+        if game_paused_for_summary:
+            self.draw_or_update_quad_indicators()
+            # Also check if the error message for "no quadrants enabled" needs to be shown/hidden
+            self.check_and_display_quad_error()
+
+    # Specific event handlers for each key - now pass the map key
+    def toggle_q1_tr_event(self, event=None): # Top-Right (I)
+        self.toggle_quadrant_flag("q1_tr")
+
+    def toggle_q2_tl_event(self, event=None): # Top-Left (U)
+        self.toggle_quadrant_flag("q2_tl")
+
+    def toggle_q3_bl_event(self, event=None): # Bottom-Left (J)
+        self.toggle_quadrant_flag("q3_bl")
+
+    def toggle_q4_br_event(self, event=None): # Bottom-Right (K)
+        self.toggle_quadrant_flag("q4_br")
+
+    def check_and_display_quad_error(self):
+        """Checks if any quadrant is enabled and displays/hides an error message."""
+        global spawn_q1_top_right, spawn_q2_top_left, spawn_q3_bottom_left, spawn_q4_bottom_right, quad_error_message_id
+        any_quad_enabled = spawn_q1_top_right or spawn_q2_top_left or spawn_q3_bottom_left or spawn_q4_bottom_right
+        
+        # Position for error message: below the quadrant indicators
+        grid_base_y = (WINDOW_HEIGHT // 2 - 100 + 150) + START_NEXT_ROUND_CIRCLE_RADIUS + 30
+        error_y_pos = grid_base_y + (QUAD_INDICATOR_HEIGHT * 2) + 10 # 10px below the grid
+
+        if not any_quad_enabled:
+            if not quad_error_message_id:
+                quad_error_message_id = self.canvas.create_text(WINDOW_WIDTH // 2, error_y_pos,
+                                                                text="At least one quadrant must be enabled to start!",
+                                                                font=SCORE_FONT, fill="black", anchor=tk.N)
+                if quad_error_message_id not in summary_elements_ids: summary_elements_ids.append(quad_error_message_id)
+        else:
+            if quad_error_message_id:
+                self.canvas.delete(quad_error_message_id)
+                if quad_error_message_id in summary_elements_ids: summary_elements_ids.remove(quad_error_message_id)
+                quad_error_message_id = None
+        return any_quad_enabled
 
 
 # --- Main ---
